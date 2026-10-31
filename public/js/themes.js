@@ -12,17 +12,17 @@ const THEMES = [
   // ★ 커스텀 테마
   {
     id: 'light-custom-2', name: '새 테마', dark: false,
-    vars: { '--bg':'#faf8f5','--bg2':'#f1ede4','--surface':'#faf8f5','--surface2':'#faf8f5','--surface3':'#f1ede4','--border':'#e8c03d','--border2':'#ce9019','--accent':'#ce9019','--accent2':'#e8c03d','--text':'#211808','--text-muted':'#ce9019','--text-light':'#e8c03d' }
+    vars: { '--bg':'#fcf9f6','--bg2':'#fcf9f6','--surface':'#f7f2ea','--surface2':'#f7f2ea','--surface3':'#fcf9f6','--border':'#e8c03d','--border2':'#946917','--accent':'#ce9019','--accent2':'#e8c03d','--text':'#211808','--text-muted':'#946917','--text-light':'#d2ae39' }
   },
   // ★ 커스텀 테마
   {
     id: 'light-custom-3', name: '새 테마', dark: false,
-    vars: { '--bg':'#f5faf7','--bg2':'#e4f1e9','--surface':'#ffffff','--surface2':'#f9fbfa','--surface3':'#eef6f2','--border':'#dfcf91','--border2':'#10592e','--accent':'#10592e','--accent2':'#457e5c','--text':'#082112','--text-muted':'#6eaa87','--text-light':'#dfcf91' }
+    vars: { '--bg':'#f5faf7','--bg2':'#e4f1e9','--surface':'#ffffff','--surface2':'#f9fbfa','--surface3':'#eef6f2','--border':'#d59c2f','--border2':'#10592e','--accent':'#10592e','--accent2':'#457e5c','--text':'#082112','--text-muted':'#6eaa87','--text-light':'#d59c2f' }
   },
   // ★ 커스텀 테마
   {
     id: 'light-custom-4', name: '새 테마', dark: false,
-    vars: { '--bg':'#f5f9fa','--bg2':'#e4eff1','--surface':'#ffffff','--surface2':'#f9fbfb','--surface3':'#eef5f6','--border':'#d49a2c','--border2':'#61abb8','--accent':'#61abb8','--accent2':'#84bdc8','--text':'#081d21','--text-muted':'#61abb8','--text-light':'#d49a2c' }
+    vars: { '--bg':'#e4eff1','--bg2':'#e4eff1','--surface':'#f9fbfb','--surface2':'#f9fbfb','--surface3':'#e4eff1','--border':'#d49a2c','--border2':'#61abb8','--accent':'#61abb8','--accent2':'#84bdc8','--text':'#081d21','--text-muted':'#61abb8','--text-light':'#d49a2c' }
   },
   {
     id: 'light-crimson', name: 'Crimson', dark: false,
