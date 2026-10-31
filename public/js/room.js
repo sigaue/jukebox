@@ -136,6 +136,36 @@ socket.on('room-state', state => {
   log(`"${state.name}" 방에 입장했습니다. 코드: ${state.code}`, 'system');
 });
 
+socket.on('capacity-warning', ({ total, max }) => {
+  const msg = `이 방의 곡이 ${total}곡으로 한도(${max}곡)에 근접했습니다. 사용하지 않는 곡을 정리해주세요.`;
+  log(msg, 'error');
+
+  const KEY = `jukesync-capacity-dismissed-${ROOM_ID}`;
+  if (localStorage.getItem(KEY) === '1') return;
+
+  const modal = document.getElementById('capacity-warning-modal');
+  if (!modal) { toast('⚠️ ' + msg, 'error', true); return; }
+  if (!modal.classList.contains('hidden')) return;
+
+  document.getElementById('capacity-warning-text').textContent = msg;
+  document.getElementById('capacity-warning-no-show').checked = false;
+  modal.classList.remove('hidden');
+
+  const close = () => {
+    if (document.getElementById('capacity-warning-no-show')?.checked) {
+      localStorage.setItem(KEY, '1');
+    }
+    modal.classList.add('hidden');
+  };
+  document.getElementById('capacity-warning-close').onclick = close;
+  modal.onclick = e => { if (e.target === modal) close(); };
+});
+
+socket.on('save-failed', ({ reason }) => {
+  toast('⚠️ ' + reason, 'error', true);
+  log(reason, 'error');
+});
+
 socket.on('resync-state', state => {
   if (!roomState) return; // 아직 최초 room-state를 못 받은 상태면 무시 (곧 room-state가 옴)
 
@@ -229,6 +259,7 @@ socket.on('user-left',   ({ nickname }) => log(`${nickname}님이 퇴장했습�
 socket.on('host-changed', () => { /* 호스트 변경 — 게스트 권한 유지 */ });
 
 socket.on('play-song', ({ song }) => {
+  cancelFadeOut(); // 곡이 바뀌면 진행 중인 페이드를 취소
   updateNowPlaying(song);
   if (roomState) { roomState.currentSong = song; roomState.isPlaying = true; }
   songEndedLock = false; // 새 곡 시작 시 lock 해제
@@ -244,6 +275,7 @@ socket.on('play-song', ({ song }) => {
 });
 
 socket.on('play', ({ videoId, time }) => {
+  cancelFadeOut(); // 페이드 도중 재생되면 페이드를 취소하고 볼륨 복구
   if (roomState) roomState.isPlaying = true;
   if (ytPlayer && ytReady) {
     if (videoId) ytPlayer.loadVideoById(videoId, time || 0);
@@ -263,14 +295,23 @@ socket.on('play', ({ videoId, time }) => {
 
 socket.on('pause', ({ time }) => {
   if (roomState) roomState.isPlaying = false;
-  // 페이드아웃 진행 중이었다면 타이머 정리
-  if (fadeTimer) {
-    clearInterval(fadeTimer);
-    fadeTimer = null;
-    const fb = document.getElementById('btn-fadeout');
-    if (fb) { fb.style.opacity = ''; fb.style.pointerEvents = ''; }
+  // 페이드아웃 진행 중이었다면 타이머만 정리한다 (볼륨 복구는 정지시킨 뒤에)
+  if (fadeTimer) { clearInterval(fadeTimer); fadeTimer = null; }
+
+  if (ytPlayer && ytReady) {
+    ytPlayer.pauseVideo();
+    if (time !== undefined) ytPlayer.seekTo(time, true);
+    // 정지가 적용된 뒤에 볼륨을 되돌린다.
+    // 되돌리기를 먼저 하면 정지 직전에 원래 음량이 잠깐 새어나온다.
+    if (fadeRestoreVol !== null) {
+      const v = fadeRestoreVol;
+      fadeRestoreVol = null;
+      setTimeout(() => { if (ytPlayer && ytReady) ytPlayer.setVolume(v); }, 60);
+    }
+  } else {
+    fadeRestoreVol = null;
   }
-  if (ytPlayer && ytReady) { ytPlayer.pauseVideo(); if (time !== undefined) ytPlayer.seekTo(time, true); }
+  setFadeBtnBusy(false);
   updatePlayBtn(false);
   const gIcon2 = document.getElementById('guest-playing-icon'); if (gIcon2) gIcon2.textContent = '⏸';
 });
@@ -282,6 +323,7 @@ socket.on('volume', ({ volume }) => {
 });
 
 socket.on('stop', () => {
+  cancelFadeOut();
   if (ytPlayer && ytReady) ytPlayer.stopVideo();
   updatePlayBtn(false);
   updateNowPlaying(null);
@@ -390,9 +432,16 @@ window.onYouTubeIframeAPIReady = function () {
       },
       onStateChange: e => {
         if (e.data === YT.PlayerState.ENDED) {
-          // 앰비언스는 항상 무한 반복
+          // 앰비언스는 항상 무한 반복 — 각자 되감아 재생한다
           ambPlayer.seekTo(0, true);
           ambPlayer.playVideo();
+          // 호스트만 서버에 알려 재생 위치 기준점을 0으로 초기화시킨다.
+          // (BGM의 song-ended와 같은 구조. 이게 없으면 서버의 currentTime이 무한정 커진다)
+          if (isHost && !ambEndedLock) {
+            ambEndedLock = true;
+            socket.emit('ambience-ended');
+            setTimeout(() => { ambEndedLock = false; }, 3000);
+          }
         }
         if (e.data === YT.PlayerState.PLAYING) {
           if (roomState && roomState.ambience && !roomState.ambience.isPlaying) {
@@ -456,11 +505,11 @@ function applyAmbienceState(amb) {
   if (loadedId !== amb.videoId) {
     // 곡이 바뀌었거나 아직 한 번도 로드된 적 없는 경우 — 로드와 동시에 페이드인
     ambPlayer.loadVideoById({ videoId: amb.videoId, startSeconds: amb.currentTime || 0 });
-    // loadVideoById() 직후 곧바로 unMute/setVolume을 보내면, 플레이어가 새 영상으로
-    // 전환하는 짧은 순간에 그 명령이 무시되어 음소거 상태로 남는 경우가 있다.
-    // 아주 짧게 지연을 줘서 이 경합을 피한다.
-    setTimeout(() => {
-      if (!roomState?.ambience?.isPlaying) return; // 그 사이 다시 일시정지됐을 수 있음
+    // 상태 메시지가 짧은 간격으로 두 번 오면 이 예약이 중복으로 걸려
+    // 페이드가 도중에 0으로 되돌아갔다가 다시 올라가는 현상이 생긴다. 이전 예약은 취소한다.
+    clearTimeout(ambLoadTimer);
+    ambLoadTimer = setTimeout(() => {
+      if (!roomState?.ambience?.isPlaying) return;
       applyAmbMuteState();
       fadeInAmbAfterPlay();
     }, 150);
@@ -497,6 +546,8 @@ function applyAmbMuteState() {
 let ambFadeInterval   = null;
 let ambCurrentVolume  = 0;     // getVolume()은 iframe에서 값이 돌아올 때까지 지연이 있어 신뢰할 수 없다.
                                 // 우리가 마지막으로 보낸 볼륨을 직접 추적해서 사용한다.
+let ambEndedLock      = false; // 반복 시 ambience-ended가 중복 전송되는 것을 막는 잠금
+let ambLoadTimer      = null;  // 곡 로드 후 페이드 시작을 미뤄두는 예약 (중복 방지용)
 let ambPendingFadeIn  = false; // "재생 명령을 보낸 시점"이 아니라 "실제로 PLAYING 상태가 된 시점"에
                                 // 페이드를 시작하기 위한 플래그 (버퍼링 지연 때문에 타이밍이 어긋나는 것 방지)
 const AMB_FADE_MS      = 2000;
@@ -629,6 +680,13 @@ function applyVolume(vol) {
   if (volLabel)  volLabel.textContent = vol;
   if (volSlider) volSlider.value = vol;
 
+  // 페이드아웃 진행 중에는 실제 볼륨을 건드리지 않는다.
+  // (건드리면 줄어들던 소리가 순간 원래대로 튄다) 대신 복구할 목표값만 갱신한다.
+  if (fadeTimer) {
+    fadeRestoreVol = isHost ? vol : calcGuestVolume();
+    return;
+  }
+
   if (isHost) {
     if (ytPlayer && ytReady) ytPlayer.setVolume(vol);
   } else {
@@ -691,23 +749,47 @@ document.getElementById('btn-repeat').onclick  = () => isHost && socket.emit('to
 
 // 페이드아웃 정지 (3초)
 let fadeTimer = null;
-document.getElementById('btn-fadeout').addEventListener('click', () => {
-  if (!isHost || !ytPlayer || !ytReady) return;
+const FADE_OUT_MS = 3000; // 페이드아웃 길이
+
+// 페이드 시작 전 볼륨. 페이드가 끝나고 실제로 일시정지된 뒤에 이 값으로 되돌린다.
+let fadeRestoreVol = null;
+
+// 페이드아웃을 취소하고 볼륨을 즉시 원래대로 되돌린다.
+// (페이드 도중 재생/일시정지/곡 변경 등이 일어난 경우)
+function cancelFadeOut(restore = true) {
+  if (fadeTimer) { clearInterval(fadeTimer); fadeTimer = null; }
+  if (restore && fadeRestoreVol !== null && ytPlayer && ytReady) {
+    ytPlayer.setVolume(fadeRestoreVol);
+  }
+  fadeRestoreVol = null;
+  setFadeBtnBusy(false);
+}
+
+function setFadeBtnBusy(busy) {
+  const btn = document.getElementById('btn-fadeout');
+  if (btn) {
+    btn.style.opacity = busy ? '0.5' : '';
+    btn.style.pointerEvents = busy ? 'none' : '';
+  }
+  const vs = document.getElementById('volume-slider');
+  if (vs) vs.disabled = busy;
+}
+
+// 각자의 브라우저에서 자기 볼륨을 0까지 줄인다.
+// onDone은 호스트에서만 넘어오며, 거기서 서버에 일시정지를 요청한다.
+function startFadeOut(duration, onDone) {
+  if (!ytPlayer || !ytReady) return;
   if (ytPlayer.getPlayerState() !== YT.PlayerState.PLAYING) return;
   if (fadeTimer) return; // 이미 페이드 중
 
-  const DURATION = 3000; // 3초
-  const INTERVAL = 50;   // 50ms 간격
-  const steps = DURATION / INTERVAL;
-  const startVol = ytPlayer.getVolume();
+  const INTERVAL = 50;
+  const steps    = Math.max(1, Math.round(duration / INTERVAL));
+  // 호스트는 마스터 볼륨, 게스트는 로컬 비율이 반영된 볼륨에서 시작한다
+  const startVol = isHost ? (roomState?.volume ?? 80) : calcGuestVolume();
+  fadeRestoreVol = startVol;
   let step = 0;
 
-  const btn = document.getElementById('btn-fadeout');
-  btn.style.opacity = '0.5';
-  btn.style.pointerEvents = 'none';
-  const volSlider = document.getElementById('volume-slider');
-  if (volSlider) volSlider.disabled = true;
-
+  setFadeBtnBusy(true);
   fadeTimer = setInterval(() => {
     step++;
     const vol = Math.max(0, Math.round(startVol * (1 - step / steps)));
@@ -715,18 +797,26 @@ document.getElementById('btn-fadeout').addEventListener('click', () => {
     if (step >= steps) {
       clearInterval(fadeTimer);
       fadeTimer = null;
-      const t = ytPlayer.getCurrentTime();
-      socket.emit('pause', { time: t });
-      // 볼륨 원상복구
-      setTimeout(() => {
-        ytPlayer.setVolume(startVol);
-        btn.style.opacity = '';
-        btn.style.pointerEvents = '';
-        const vs = document.getElementById('volume-slider');
-        if (vs) vs.disabled = false;
-      }, 100);
+      if (onDone) onDone();
+      // 볼륨 복구는 여기서 하지 않는다.
+      // 실제로 일시정지가 적용된 뒤(pause 수신 시)에 해야 끝에서 소리가 튀지 않는다.
     }
   }, INTERVAL);
+}
+
+document.getElementById('btn-fadeout').addEventListener('click', () => {
+  if (!isHost || !ytPlayer || !ytReady) return;
+  if (ytPlayer.getPlayerState() !== YT.PlayerState.PLAYING) return;
+  if (fadeTimer) return;
+  // 모두가 동시에 페이드를 시작하도록 서버에 알린다 (호스트 자신도 수신해서 시작)
+  socket.emit('fade-out', { duration: FADE_OUT_MS });
+});
+
+socket.on('fade-out', ({ duration }) => {
+  startFadeOut(duration, isHost ? () => {
+    // 페이드가 끝난 시점에 호스트만 일시정지를 요청한다
+    socket.emit('pause', { time: ytPlayer.getCurrentTime() });
+  } : null);
 });
 
 document.getElementById('volume-slider').oninput = e => {
@@ -742,7 +832,8 @@ if (guestVolSlider) {
   guestVolSlider.oninput = e => {
     const label = document.getElementById('guest-vol-label');
     if (label) label.textContent = e.target.value;
-    if (ytPlayer && ytReady) ytPlayer.setVolume(calcGuestVolume());
+    if (fadeTimer) { fadeRestoreVol = calcGuestVolume(); }
+    else if (ytPlayer && ytReady) ytPlayer.setVolume(calcGuestVolume());
     if (ambPlayer && ambReady && audioUnlocked && roomState?.ambience?.videoId) {
       setAmbVolumeTracked(calcGuestAmbienceVolume());
     }
@@ -833,11 +924,11 @@ function updateNowPlaying(song) {
   const bigArt   = document.getElementById('guest-big-art');
   const anim     = document.getElementById('guest-anim');
   if (bigTitle) bigTitle.innerHTML = song
-    ? `<a class="song-yt-link guest-title-link" href="https://www.youtube.com/watch?v=${song.videoId}" target="_blank" rel="noopener" title="YouTube에서 열기">${esc(song.title)}</a>`
+    ? `<a class="song-yt-link guest-title-link" href="https://www.youtube.com/watch?v=${esc(song.videoId)}" target="_blank" rel="noopener" title="YouTube에서 열기">${esc(song.title)}</a>`
     : '재생 중인 곡 없음';
   if (bigCh)    bigCh.textContent    = song ? (song.channelTitle || '—') : '—';
   if (bigArt)   bigArt.innerHTML     = song
-    ? `<img src="https://img.youtube.com/vi/${song.videoId}/hqdefault.jpg" alt="" />`
+    ? `<img src="https://img.youtube.com/vi/${esc(song.videoId)}/hqdefault.jpg" alt="" />`
     : '♪';
   if (anim) anim.style.display = song ? '' : 'none';
 }
@@ -953,11 +1044,14 @@ function renderSongs(songs, playlistId, containerId) {
 
     item.innerHTML = `
       <div class="song-drag-handle">⠿</div>
-      <img class="song-thumb" src="https://img.youtube.com/vi/${song.videoId}/default.jpg" alt="" loading="lazy" />
+      <img class="song-thumb" src="https://img.youtube.com/vi/${esc(song.videoId)}/default.jpg" alt="" loading="lazy" />
       <div class="song-info">
-        <p class="song-title"><a class="song-yt-link" href="https://www.youtube.com/watch?v=${song.videoId}" target="_blank" rel="noopener" title="YouTube에서 열기">${esc(song.title)}</a></p>
-        <p class="song-ch">${esc(song.channelTitle || '')}</p>
-        ${song.memo ? `<p class="song-memo">${esc(song.memo)}</p>` : ''}
+        <p class="song-title"><a class="song-yt-link" href="https://www.youtube.com/watch?v=${esc(song.videoId)}" target="_blank" rel="noopener" title="YouTube에서 열기">${esc(song.title)}</a></p>
+        <div class="song-ch-row">
+          <p class="song-ch">${esc(song.channelTitle || '')}</p>
+          ${(isHost && !song.memo) ? `<button class="js-add-memo song-memo-add" title="메모 추가">＋</button>` : ''}
+        </div>
+        ${song.memo ? `<p class="song-memo${isHost ? ' song-memo--editable' : ''}"${isHost ? ' title="클릭해서 메모 수정"' : ''}>${esc(song.memo)}</p>` : ''}
       </div>
       <div class="song-actions">
         ${isHost ? `<button class="btn btn--icon btn--play-song js-play-song" title="재생">▶</button>` : ''}
@@ -977,6 +1071,17 @@ function renderSongs(songs, playlistId, containerId) {
         e.stopPropagation();
         socket.emit('toggle-song-loop', { playlistId: playlistId || null, songId: song.id });
       });
+      // 메모 추가(＋) / 기존 메모 클릭 → 그 자리에서 바로 편집
+      const addBtn  = item.querySelector('.js-add-memo');
+      const memoEl  = item.querySelector('.song-memo--editable');
+      if (addBtn) addBtn.addEventListener('click', e => {
+        e.stopPropagation();
+        startMemoEdit(item, song, playlistId, '');
+      });
+      if (memoEl) memoEl.addEventListener('click', e => {
+        e.stopPropagation();
+        startMemoEdit(item, song, playlistId, song.memo || '');
+      });
     }
     item.querySelector('.js-move-song').addEventListener('click', (e) => {
       e.stopPropagation();
@@ -990,6 +1095,52 @@ function renderSongs(songs, playlistId, containerId) {
     setupSongDrag(item, idx, playlistId);
     el.appendChild(item);
   });
+}
+
+// 곡 행 안에서 메모를 바로 편집한다. 저장은 Enter 또는 포커스 해제, 취소는 Esc.
+function startMemoEdit(item, song, playlistId, current) {
+  if (item.querySelector('.song-memo-input')) return; // 이미 편집 중
+  const info = item.querySelector('.song-info');
+  if (!info) return;
+
+  const addBtn = item.querySelector('.js-add-memo');
+  if (addBtn) addBtn.style.display = 'none';
+  const memoEl = item.querySelector('.song-memo');
+  if (memoEl) memoEl.style.display = 'none';
+
+  const input = document.createElement('input');
+  input.type = 'text';
+  input.className = 'song-memo-input';
+  input.value = current;
+  input.maxLength = 300;
+  input.placeholder = '메모 입력...';
+  info.appendChild(input);
+  input.focus();
+  input.select();
+
+  let done = false;
+  const finish = (save) => {
+    if (done) return;
+    done = true;
+    const val = input.value.trim();
+    input.remove();
+    if (save && val !== current) {
+      // 서버가 갱신된 목록을 다시 내려주므로 화면은 그때 새로 그려진다
+      socket.emit('update-song-memo', { playlistId: playlistId || null, songId: song.id, memo: val });
+    } else {
+      if (addBtn) addBtn.style.display = '';
+      if (memoEl) memoEl.style.display = '';
+    }
+  };
+
+  input.addEventListener('keydown', e => {
+    e.stopPropagation();
+    if (e.key === 'Enter')  { e.preventDefault(); finish(true); }
+    if (e.key === 'Escape') { e.preventDefault(); finish(false); }
+  });
+  input.addEventListener('blur', () => finish(true));
+  // 편집 중 드래그로 행이 움직이지 않도록
+  input.addEventListener('mousedown', e => e.stopPropagation());
 }
 
 function renderQueue(queue) {
@@ -1502,13 +1653,21 @@ function getSidebarWidth() {
 // "사용자가 실제로 원하는 너비"와 "지금 공간이 부족해 화면에 강제로 맞춘 너비"를 구분한다.
 // localStorage에는 오직 사용자가 직접 드래그를 마쳤을 때(mouseup)만 기록되므로,
 // 여기서 읽는 값은 항상 오염되지 않은 "원래 희망 너비"다.
+// 사용자가 쓸 수 있는 최소 너비. 공간이 부족해 화면상 이보다 좁게 그려질 수는 있어도,
+// "희망 너비"가 이 아래로 저장되지는 않게 해서 다시 넓힐 수 없는 상태를 막는다.
+const SIDEBAR_MIN_WIDTH = 260;
+const SEARCH_MIN_WIDTH  = 200;
+const SEARCH_MAX_WIDTH  = 700;
+
 function getDesiredSidebarWidth() {
   const saved = localStorage.getItem('jukesync-sidebar-width');
-  return saved ? parseInt(saved, 10) : getSidebarWidth();
+  const w = saved ? parseInt(saved, 10) : getSidebarWidth();
+  return Math.max(SIDEBAR_MIN_WIDTH, w || SIDEBAR_MIN_WIDTH);
 }
 function getDesiredSearchWidth() {
   const saved = localStorage.getItem('jukesync-search-width');
-  return saved ? parseInt(saved, 10) : getSearchSectionWidth();
+  const w = saved ? parseInt(saved, 10) : getSearchSectionWidth();
+  return Math.min(SEARCH_MAX_WIDTH, Math.max(SEARCH_MIN_WIDTH, w || SEARCH_MIN_WIDTH));
 }
 
 // 사이드바/검색창 너비를 한 번에 같이 계산해서 확정한다.
@@ -1628,9 +1787,9 @@ window.addEventListener('resize', scheduleLayoutClamp);
   const COLLAPSED_KEY = 'jukesync-search-collapsed';
   const WIDTH_KEY     = 'jukesync-search-width';
 
-  // 너비 복원
-  const savedWidth = localStorage.getItem(WIDTH_KEY);
-  if (savedWidth) section.style.width = savedWidth + 'px';
+  // 너비 복원 — 저장값이 사용 가능 최소치보다 작아도 보정된 값으로 되살린다
+  section.style.width    = getDesiredSearchWidth() + 'px';
+  section.style.minWidth = '';
   // 저장된 값이 현재 창 크기(또는 사이드바 상태)와 안 맞을 수 있으니 로드 시 한 번 보정
   clampSearchToViewport();
 
@@ -1648,11 +1807,15 @@ window.addEventListener('resize', scheduleLayoutClamp);
     localStorage.setItem(COLLAPSED_KEY, isCollapsed ? '1' : '0');
     // 접힌 상태에서는 너비 저장 안 함
     if (!isCollapsed) {
-      const savedWidth = localStorage.getItem('jukesync-search-width');
-      if (savedWidth) section.style.width = savedWidth + 'px';
+      // 좁혀진 채 저장돼 있었더라도 다시 쓸 수 있는 너비로 펼친다
+      section.style.width    = getDesiredSearchWidth() + 'px';
+      section.style.minWidth = '';
       clampSearchToViewport();
     } else {
-      // 검색창이 접혀 공간이 생겼으니, 사이드바가 넓어질 수 있는지는 다시 줄일 필요 없음(그대로 둠)
+      // 좁혀진 상태에서 넣어둔 인라인 min-width가 남아 있으면 접어도 그 폭만큼 빈 띠가 남는다.
+      // (인라인 스타일이 .collapsed 규칙의 min-width:0 보다 우선하기 때문)
+      section.style.minWidth = '';
+      section.style.width    = '';
     }
     updateMiniPlayerPosition();
   });
@@ -1665,18 +1828,25 @@ window.addEventListener('resize', scheduleLayoutClamp);
     resizeHandle.classList.add('dragging');
     section.classList.add('resizing');
 
+    let desiredWidth = startWidth; // 사용자가 의도한 너비 (화면에 그려진 너비와 별개)
+
     function onMove(e) {
-      const delta    = startX - e.clientX; // 왼쪽으로 드래그 = 넓어짐
-      // 사이드바 너비와 활동 로그 최소 200px을 뺀 나머지가 상한 (활동 로그가 검색창보다 우선)
+      const delta = startX - e.clientX; // 왼쪽으로 드래그 = 넓어짐
+      // 사용자가 끌 수 있는 범위는 200~700px로 제한한다.
+      // (0까지 줄어들면 드래그 핸들을 다시 잡을 수 없게 되므로)
+      desiredWidth = Math.min(SEARCH_MAX_WIDTH, Math.max(SEARCH_MIN_WIDTH, startWidth + delta));
+      // 다만 화면에 실제로 그릴 때는 활동 로그 200px 확보가 우선이므로,
+      // 공간이 모자라면 희망 너비보다 좁게(필요하면 200px 미만으로도) 그린다.
       const dynamicMax = window.innerWidth - getSidebarWidth() - CENTER_MIN_WIDTH;
-      const newWidth = Math.min(700, dynamicMax, Math.max(0, startWidth + delta));
-      section.style.width    = newWidth + 'px';
-      section.style.minWidth = newWidth < 200 ? newWidth + 'px' : '';
+      const rendered   = Math.max(0, Math.min(desiredWidth, dynamicMax));
+      section.style.width    = rendered + 'px';
+      section.style.minWidth = rendered < SEARCH_MIN_WIDTH ? rendered + 'px' : '';
     }
     function onUp() {
       resizeHandle.classList.remove('dragging');
       section.classList.remove('resizing');
-      localStorage.setItem(WIDTH_KEY, parseInt(section.style.width));
+      // 그려진 너비가 아니라 "희망 너비"를 저장한다.
+      localStorage.setItem(WIDTH_KEY, desiredWidth);
       document.removeEventListener('mousemove', onMove);
       document.removeEventListener('mouseup', onUp);
     }
